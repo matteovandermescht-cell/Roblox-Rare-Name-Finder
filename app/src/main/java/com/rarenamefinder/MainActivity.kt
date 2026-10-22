@@ -181,6 +181,7 @@ class MainActivity : Activity() {
         root.addView(scroller, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
         refreshChoices()
+        root.post { runScan() }
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -233,83 +234,111 @@ class MainActivity : Activity() {
         }
     }
 
+    private val syllables = listOf("ka", "vi", "no", "ra", "zu", "xe", "lu", "mi", "ry", "va", "ko", "ne", "ta", "ri", "zo", "ly", "sa", "ki", "mo", "re", "ny", "vo", "xi", "ja", "te", "lo", "ae", "io")
+
     private fun makeName(length: Int): String {
-        val name = when (Random.nextInt(4)) {
-            0 -> (starts.random() + endings.random()).take(length)
-            1 -> buildString {
-                append(consonants.random())
-                append(vowels.random())
-                while (this.length < length) append(if (this.length % 2 == 0) consonants.random() else vowels.random())
-            }
-            2 -> buildString {
-                append(consonants.random().toString().uppercase())
-                repeat(length - 1) { index ->
-                    append(if (index % 2 == 0) vowels.random() else consonants.random())
-                }
-            }
-            else -> {
-                val base = listOf("zy", "vex", "nyx", "kai", "ryn", "lux", "zen", "aki", "neo", "rio", "kyo", "xen").random()
-                (base + buildString {
-                    while (base.length + this.length < length) append((consonants + vowels).random())
-                }).take(length)
-            }
+        val options = syllables
+        val candidate = when (length) {
+            4 -> options.random() + options.random()
+            5 -> options.random() + options.random() + listOf("n", "r", "x", "s", "z", "y").random()
+            else -> options.random() + options.random() + options.random()
         }
-        return name.padEnd(length, 'x').take(length)
+        return candidate.take(length).lowercase()
+    }
+
+    private fun checkAvailability(name: String): Boolean {
+        val query = "request.username=" + java.net.URLEncoder.encode(name, "UTF-8") +
+            "&request.birthday=2000-01-01&request.context=Signup"
+        val conn = (URL("https://auth.roblox.com/v1/usernames/validate?$query").openConnection() as HttpURLConnection)
+        conn.requestMethod = "GET"
+        conn.connectTimeout = 10000
+        conn.readTimeout = 10000
+        conn.setRequestProperty("Accept", "application/json")
+        conn.setRequestProperty("User-Agent", "RareNameFinder/1.0")
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val response = stream?.bufferedReader()?.use { it.readText() } ?: ""
+        conn.disconnect()
+        if (code == 429) throw IllegalStateException("Roblox rate-limited the search (HTTP 429). Please wait and try again.")
+        if (code !in 200..299) throw IllegalStateException("Roblox validation returned HTTP $code")
+        return JSONObject(response).optInt("code", -1) == 0
     }
 
     private fun runScan() {
         if (busy) return
         busy = true
-        generateButton.text = "⏳   GENERATING..."
+        generateButton.text = "⏳   SEARCHING FOR AVAILABLE NAMES..."
         generateButton.alpha = .75f
         results.removeAllViews()
         val len = selectedLength
         val count = selectedCount
-        status.text = "Building your name drop…\\nChecking candidates with Roblox."
+        status.text = "Searching automatically…\nOnly names confirmed by Roblox will be shown."
         thread {
-            val candidates = linkedSetOf<String>()
-            while (candidates.size < count) candidates.add(makeName(len))
-            val existing = mutableSetOf<String>()
+            val found = linkedSetOf<String>()
+            var attempts = 0
             var error: String? = null
+            val maxAttempts = count * 12
             try {
-                candidates.toList().chunked(10).forEachIndexed { index, batch ->
+                while (found.size < count && attempts < maxAttempts) {
+                    val batch = linkedSetOf<String>()
+                    while (batch.size < 10 && attempts + batch.size < maxAttempts) batch.add(makeName(len))
+                    attempts += batch.size
+                    val existing = mutableSetOf<String>()
                     val conn = (URL("https://users.roblox.com/v1/usernames/users").openConnection() as HttpURLConnection)
                     conn.requestMethod = "POST"
                     conn.connectTimeout = 10000
                     conn.readTimeout = 10000
                     conn.setRequestProperty("Content-Type", "application/json")
                     conn.setRequestProperty("Accept", "application/json")
+                    conn.setRequestProperty("User-Agent", "RareNameFinder/1.0")
                     conn.doOutput = true
-                    val body = JSONObject().put("usernames", JSONArray(batch)).put("excludeBannedUsers", true).toString()
+                    val body = JSONObject().put("usernames", JSONArray(batch)).put("excludeBannedUsers", false).toString()
                     conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
                     val code = conn.responseCode
                     val stream = if (code in 200..299) conn.inputStream else conn.errorStream
                     val response = stream?.bufferedReader()?.use { it.readText() } ?: ""
                     conn.disconnect()
-                    if (code !in 200..299) throw IllegalStateException("Roblox returned HTTP $code")
+                    if (code == 429) throw IllegalStateException("Roblox rate-limited the search (HTTP 429). Please wait and try again.")
+                    if (code !in 200..299) throw IllegalStateException("Roblox lookup returned HTTP $code")
                     val arr = JSONObject(response).optJSONArray("data") ?: JSONArray()
                     for (i in 0 until arr.length()) {
                         val username = arr.optJSONObject(i)?.optString("requestedUsername", "")?.lowercase()
                         if (!username.isNullOrBlank()) existing.add(username)
                     }
-                    runOnUiThread { status.text = "Checking batch \${index + 1}/\${(count + 9) / 10}…" }
-                    if (index < (count + 9) / 10 - 1) Thread.sleep(900)
+                    for (candidate in batch) {
+                        if (found.size >= count) break
+                        if (candidate.lowercase() in existing || candidate in found) continue
+                        runOnUiThread {
+                            status.text = "Checking names with Roblox…\nConfirmed ${found.size} of $count · tested $attempts"
+                        }
+                        if (checkAvailability(candidate)) found.add(candidate)
+                        Thread.sleep(1100)
+                    }
+                    runOnUiThread { status.text = "Searching…\nConfirmed ${found.size} of $count available names." }
+                    if (found.size < count) Thread.sleep(500)
                 }
             } catch (e: Exception) {
                 error = e.message ?: "Network error"
             }
-            val found = candidates.filter { it.lowercase() !in existing }
             runOnUiThread {
                 busy = false
-                generateButton.text = "✦   FIND RARE USERNAMES"
+                generateButton.text = "↻   SEARCH AGAIN"
                 generateButton.alpha = 1f
-                status.text = if (error == null) {
-                    "✦  \${found.size} candidates found\\nNo matching account returned — availability isn't guaranteed."
-                } else {
-                    "Check incomplete: $error\\nSome results may be missing."
+                status.text = when {
+                    found.size >= count -> "✓  $count names confirmed available by Roblox."
+                    error != null -> "Found ${found.size} of $count confirmed names.\n$error"
+                    else -> "Found ${found.size} of $count confirmed names after checking $attempts candidates.\nTry again later for more results."
                 }
                 found.forEachIndexed { index, name -> addResult(name, index + 1) }
-                if (found.isEmpty()) status.text = "No candidates this time.\\nTry again in a moment."
+                if (found.isEmpty()) {
+                    results.addView(TextView(this).apply {
+                        text = "No names were confirmed available this time. Try again later."
+                        textSize = 13f
+                        setTextColor(muted)
+                        setPadding(dp(12), dp(12), dp(12), dp(12))
+                        background = rounded(panel, 14)
+                    })
+                }
             }
         }
     }
